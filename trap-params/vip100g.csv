@@ -1,0 +1,101 @@
+Parameter,"Control
+Trap Value",Trap Value to Set
+Video Notify, , 
+Loss of Video,400.0.0@i,FALSE
+Video Frozen,400.0.1@i,FALSE
+Video Black,400.0.2@i,FALSE
+Motion Detected,400.0.3@i,FALSE
+Audio Notify, , 
+Channel 1 Audio Loss,530.0.0@i,FALSE
+Channel 2 Audio Loss,530.0.1@i,FALSE
+Channel 3 Audio Loss,530.0.2@i,FALSE
+Channel 4 Audio Loss,530.0.3@i,FALSE
+Channel 5 Audio Loss,530.0.4@i,FALSE
+Channel 6 Audio Loss,530.0.5@i,FALSE
+Channel 7 Audio Loss,530.0.6@i,FALSE
+Channel 8 Audio Loss,530.0.7@i,FALSE
+Channel 9 Audio Loss,530.0.8@i,FALSE
+Channel 10 Audio Loss,530.0.9@i,FALSE
+Channel 11 Audio Loss,530.0.10@i,FALSE
+Channel 12 Audio Loss,530.0.11@i,FALSE
+Channel 13 Audio Loss,530.0.12@i,FALSE
+Channel 14 Audio Loss,530.0.13@i,FALSE
+Channel 15 Audio Loss,530.0.14@i,FALSE
+Channel 16 Audio Loss,530.0.15@i,FALSE
+Channel 1 Audio Over,530.0.16@i,FALSE
+Channel 2 Audio Over,530.0.17@i,FALSE
+Channel 3 Audio Over,530.0.18@i,FALSE
+Channel 4 Audio Over,530.0.19@i,FALSE
+Channel 5 Audio Over,530.0.20@i,FALSE
+Channel 6 Audio Over,530.0.21@i,FALSE
+Channel 7 Audio Over,530.0.22@i,FALSE
+Channel 8 Audio Over,530.0.23@i,FALSE
+Channel 9 Audio Over,530.0.24@i,FALSE
+Channel 10 Audio Over,530.0.25@i,FALSE
+Channel 11 Audio Over,530.0.26@i,FALSE
+Channel 12 Audio Over,530.0.27@i,FALSE
+Channel 13 Audio Over,530.0.28@i,FALSE
+Channel 14 Audio Over,530.0.29@i,FALSE
+Channel 15 Audio Over,530.0.30@i,FALSE
+Channel 16 Audio Over,530.0.31@i,FALSE
+Channel 1 Audio Silence,530.0.32@i,FALSE
+Channel 2 Audio Silence,530.0.33@i,FALSE
+Channel 3 Audio Silence,530.0.34@i,FALSE
+Channel 4 Audio Silence,530.0.35@i,FALSE
+Channel 5 Audio Silence,530.0.36@i,FALSE
+Channel 6 Audio Silence,530.0.37@i,FALSE
+Channel 7 Audio Silence,530.0.38@i,FALSE
+Channel 8 Audio Silence,530.0.39@i,FALSE
+Channel 9 Audio Silence,530.0.40@i,FALSE
+Channel 10 Audio Silence,530.0.41@i,FALSE
+Channel 11 Audio Silence,530.0.42@i,FALSE
+Channel 12 Audio Silence,530.0.43@i,FALSE
+Channel 13 Audio Silence,530.0.44@i,FALSE
+Channel 14 Audio Silence,530.0.45@i,FALSE
+Channel 15 Audio Silence,530.0.46@i,FALSE
+Channel 16 Audio Silence,530.0.47@i,FALSE
+Group 1 Audio Mono 1 and 2,530.0.48@i,FALSE
+Group 1 Audio Mono 3 and 4,530.0.49@i,FALSE
+Group 2 Audio Mono 1 and 2,530.0.50@i,FALSE
+Group 2 Audio Mono 3 and 4,530.0.51@i,FALSE
+Group 3 Audio Mono 1 and 2,530.0.52@i,FALSE
+Group 3 Audio Mono 3 and 4,530.0.53@i,FALSE
+Group 4 Audio Mono 1 and 2,530.0.54@i,FALSE
+Group 4 Audio Mono 3 and 4,530.0.55@i,FALSE
+Group 1 PhaseRev 1 and 2,530.0.56@i,FALSE
+Group 1 PhaseRev 3 and 4,530.0.57@i,FALSE
+Group 2 PhaseRev 1 and 2,530.0.58@i,FALSE
+Group 2 PhaseRev 3 and 4,530.0.59@i,FALSE
+Group 3 PhaseRev 1 and 2,530.0.60@i,FALSE
+Group 3 PhaseRev 3 and 4,530.0.61@i,FALSE
+Group 4 PhaseRev 1 and 2,530.0.62@i,FALSE
+Group 4 PhaseRev 3 and 4,530.0.63@i,FALSE
+System Notify, , 
+Main Port 1 - Port Link Down,340.0.0.0@i,TRUE
+Main Port 1 - Received Link Error,340.0.0.1@i,TRUE
+Main Port 2 - Port Link Down,340.0.1.0@i,TRUE
+Main Port 2 - Received Link Error,340.0.1.1@i,TRUE
+Backup Port 1 - Port Link Down,340.1.0.0@i,TRUE
+Backup Port 1 - Received Link Error,340.1.0.1@i,TRUE
+Backup Port 2 - Port Link Down,340.1.1.0@i,TRUE
+Backup Port 2 - Received Link Error,340.1.1.1@i,TRUE
+CPU Usage too high,850.2@i,TRUE
+CPU Temperature too high,850.3@i,TRUE
+Memory Usage too high,850.4@i,TRUE
+FPGA temperature fabric too high,850.5@i,TRUE
+FPGA temperature BR too high,850.6@i,TRUE
+FPGA temperature TR too high,850.7@i,TRUE
+FPGA temperature BL too high,850.8@i,TRUE
+FPGA temperature TL too high,850.9@i,TRUE
+Fan J28 Stalled,850.10@i,TRUE
+Fan J29 Stalled,850.11@i,TRUE
+Fan J30 Stalled,850.12@i,TRUE
+Fan J31 Stalled,850.13@i,TRUE
+Fan J32 Stalled,850.14@i,TRUE
+Fan J33 Stalled,850.15@i,TRUE
+Fan J34 Stalled,850.16@i,TRUE
+Fan J35 Stalled,850.17@i,TRUE
+NTP Error,850.18@i,TRUE
+CPU Load too high,850.19@i,TRUE
+NTP Unsynchronised,850.20@i,TRUE
+ ,,

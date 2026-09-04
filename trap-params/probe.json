@@ -1,0 +1,15 @@
+{
+  "device": "probe",
+  "source": "hand-written",
+  "comment": "One-varid schema for the set-operation smoke test. See README.md -> Single-varid smoke test. Change the single params entry to probe a different varid; the type is derived from the @suffix, so no other edit is needed. port_count stays null so nothing expands.",
+  "port_count": null,
+  "param_count": 1,
+  "groups": {
+    "probe": {
+      "target": 1,
+      "params": {
+        "Loss of Video": "400.0.0@i"
+      }
+    }
+  }
+}

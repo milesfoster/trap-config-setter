@@ -1,0 +1,29 @@
+# Example --hosts-file for trapSetter. Copy this, edit, and pass it with:
+#
+#     python3 trapSetter.py --device vip100g --hosts-file fleet.txt --check
+#
+# Format:
+#   - one host per line (an address or a resolvable name)
+#   - blank lines are ignored
+#   - "#" starts a comment, whole-line or trailing
+#   - several hosts on one line is fine, separated by commas or spaces
+#   - duplicates are removed, and the order you write is the order they run in
+#
+# Hosts are processed one at a time by default. --workers N runs N of them
+# concurrently; the pacing delay is per-host, so that does not increase load on
+# any single device.
+
+# --- studio A ---
+172.17.223.93
+172.17.223.94          # spare frame
+
+# --- studio B ---
+172.17.223.95 172.17.223.96
+172.17.223.97,172.17.223.98
+
+# --- names resolve too ---
+# vip100g-studioc-1.example.net
+
+# A host commented out here is simply skipped - handy for parking a frame
+# that is down for maintenance without losing it from the list.
+# 172.17.223.99        # RMA, do not poll
