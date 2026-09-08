@@ -1,0 +1,5 @@
+# Python bytecode. Was tracked in the initial commit, so it turned up as a
+# modified file in every diff; untracked with `git rm -r --cached __pycache__`.
+__pycache__/
+*.py[cod]
+logs/

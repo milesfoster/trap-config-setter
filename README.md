@@ -11,10 +11,12 @@ It shares ptpMon's transport shape (protocol discovery, endpoint discovery, two
 auth paths, per-request cookie/auth to stay thread-safe) but nothing else. It is
 a standalone script with no poller integration and no imports from ptpMon.
 
-> **Status: not yet validated against real hardware.** Every offline path —
-> parsing, schema build/round-trip, port expansion, `--list`, reporting — works.
-> No `set` RPC has ever reached a device. Start with the
-> [single-varid smoke test](#single-varid-smoke-test); see [PLAN.md](PLAN.md).
+> **Status: write path validated on hardware (2026-09-08).** The single-varid
+> smoke test passed against a vip100g on WebEasy 1.5: `set` round-trips in both
+> directions and the phase-3 read-back confirms it. Two caveats — that device
+> resolved to the **delegate/Basic-auth** endpoint, so the `cfgjsonrpc`
+> cookie-login path's *write* behaviour is still unproven ([PLAN.md](PLAN.md)
+> P1-2), and nothing wider than a 5-varid set has been applied yet.
 
 ---
 
@@ -29,6 +31,8 @@ trap-config-setter/
     vip100g.csv          WebEasy "Notify" page export (conversion input only)
     vip100g.json         the reference schema (what runtime actually reads)
     probe.json           one-varid schema for the smoke test
+    probe4.json          five-varid mixed-outcome schema (one bad index)
+  logs/                  run reports land here by default; contents gitignored
   README.md
   PLAN.md
 ```
@@ -39,10 +43,16 @@ trap-config-setter/
 python3 test_trapSetter.py            # or: python3 -m unittest -v test_trapSetter
 ```
 
-32 tests, ~4ms, no device and no network. Currently covering endpoint discovery
-and the auth path it selects — the transport decision duplicated from ptpMon,
-and therefore the one most likely to drift. `unittest` rather than pytest, and
-no f-strings, so the suite runs wherever the module does.
+62 tests, ~20ms, no device and no network. Covering endpoint discovery and the
+auth path it selects (the transport decision duplicated from ptpMon, and
+therefore the one most likely to drift), `--varids`/`--target`, and interrupt
+handling. `unittest` rather than pytest, and no f-strings, so the suite runs
+wherever the module does.
+
+The interrupt tests are the ones worth keeping honest: they are verified to
+**fail on regression**, not merely to pass. Making an unreached varid fall
+back to `ok` fails 1, dropping the not-started placeholders fails 4, and
+letting `--varids` silently match nothing fails 2.
 
 See PLAN.md P3-1 for what is still uncovered (the pure parsing and expansion
 functions). Run it before touching `HostSession`: `extras/` is gitignored, so
@@ -124,6 +134,13 @@ python3 trapSetter.py --params trap-params/probe.json --hosts $IP --user root --
 python3 trapSetter.py --params trap-params/probe.json --hosts $IP --user root --password evertz --check
 ```
 
+**If step 1 reports `ok`, the varid already holds 1 and step 2 writes nothing** —
+phase 1 finds it converged, and the run then proves nothing about `set`, which is
+the whole point. Run the sequence in reverse instead: step 4 first
+(`--force-false`, a genuine `1 -> 0` write), confirm the UI has gone *unticked*,
+then step 2 to restore it. That was the case on the first device this was run
+against.
+
 Each command is on one line so it pastes cleanly; add `\` continuations to taste.
 
 The probe accepts `--hosts-file` like any other run, so the same five steps work
@@ -144,6 +161,16 @@ To probe a **different** varid, copy `probe.json` and change the one entry, or
 edit it in place — the group name and `device` field are free text and affect
 only report headings. To test a `@s` or `@b` parameter, just use its varid; the
 type is derived from the suffix.
+
+Observed reply shapes on WebEasy 1.5, for reference — note that every entry
+echoes its `id`, and that a bad varid errors **only its own entry** rather than
+poisoning the chunk:
+
+```json
+get  ok    {"id":"400.0.0@i","type":"integer","value":0}
+set  ok    {"id":"400.0.0@i","status":"success","type":"integer","value":1}
+     bad   {"error":"Failed to process request","id":"400.99.99@i","type":"integer"}
+```
 
 If step 2 reports `failed` with a verify mismatch while step 1 read cleanly, the
 `get` path works and the `set` path does not — that is the credentialed-write
@@ -353,6 +380,7 @@ a re-run against a converged fleet issues **no writes at all**.
 | `would-change` | `--check` only: differs from target, nothing written. |
 | `failed` | Written but read-back disagrees, or the set was rejected. |
 | `unresolved` | Phase 1 read errored — the device cannot resolve this varid at all. Writing it would fail the same way, so the write is skipped and said so. Firmware variants genuinely lack some notify rows. `--set-all` writes anyway. |
+| `skipped` | Interrupted runs only. The varid was never decided. If a write had already gone out for it, the detail says so — it is neither confirmed nor known to have failed. |
 
 Detail lines keep contradictions visible rather than papering over them: a varid
 that verifies correctly but whose `set` returned a complaint reports
@@ -360,6 +388,28 @@ that verifies correctly but whose `set` returned a complaint reports
 
 A chunk-level RPC failure attaches to **every varid in the chunk**, so a dropped
 request is never mistaken for a converged value.
+
+### Interruption
+
+Ctrl-C does not lose the run. The host in flight is marked `INTERRUPTED`,
+hosts after it are recorded as `NOT STARTED` rather than dropped (a
+shortened recap would read as though the fleet were smaller), and the report
+is written from whatever completed. Exit status is `1`.
+
+What an interrupted report will not do is call an unexamined varid `ok`:
+
+| Where it stopped | What the report says |
+|---|---|
+| **phase 1** (read) | `interrupted during read; no write was issued`, plus a count of parameters **never assessed**. Phase 1 writes nothing, so there is nothing to be partway through and the device is untouched. Records are not built until the read completes, so a phase-1 interrupt yields no per-varid rows. |
+| **phase 2/3** (write, verify) | per-varid `skipped` rows, and for anything already written, `write issued but not verified before the interrupt`. |
+
+Because expansion is port-major, the inputs already reached are coherent —
+which is only actionable because the report says where it stopped.
+
+Under `--workers N` the interrupt reaches worker threads through a flag
+checked at each pacing point, since `KeyboardInterrupt` is delivered only to
+the main thread. They wind down at their next request boundary rather than
+running the fleet to completion.
 
 ### Comparison normalisation
 
@@ -452,7 +502,9 @@ host's `error` field and it is reported `UNREACHABLE`.
 | `--params PATH` | Explicit source, overriding `--device`. Dispatched by extension. |
 | `--groups a,b` | Apply only these groups. Default: all. Unknown group is an error listing what the file has. |
 | `--ports N` | Override the schema's `port_count`. |
-| `--force-false` | Override every target to `0`, ignoring `TRUE` entries. |
+| `--varids a,b` | Apply only these varids, filtering **after** port expansion so a token can name one input (`400.31.0@i`). The `@suffix` is optional. An unmatched varid is an error, never a silently empty run. |
+| `--target VALUE` | Override every target in either direction: `0`/`1`, `FALSE`/`TRUE`, a number, or a string for an `@s` parameter. Coerced per varid suffix, so one value suits a mixed set. |
+| `--force-false` | Alias for `--target 0`. Mutually exclusive with it. |
 | `--list` | Print the parsed set and exit. Touches no devices. |
 | `--build-schema [OUT]` | Convert export → JSON schema and exit. `-` for stdout. |
 
@@ -463,19 +515,42 @@ per line, `#` comments), `--user`, `--password`, `--proto {http,https}`,
 **Behaviour:** `--check`, `--no-verify`, `--set-all`, `--chunk-size`, `--delay`,
 `--workers`, `--retries`, `--timeout`.
 
-**Output:** `--report PATH` (default `trap-report-<device>-<timestamp>.txt`),
-`--json PATH`, `--brief`, `--quiet`.
+**Output:** `--report PATH` (default
+`logs/trap-report-<device>-<timestamp>.txt`), `--json PATH`, `--brief`,
+`--quiet`.
 
-Order of operations in `main()` matters and is deliberate: **group filter → port
-expansion → `--force-false`**. Filtering first means a `--groups video` run does
-not build 4379 traps and discard most of them; `--force-false` last means the
-override lands on every replica.
+Order of operations in `main()` matters and is deliberate: **group filter →
+port expansion → `--varids` → target override**. Group filtering first means a
+`--groups video` run does not build 4379 traps and discard most of them;
+`--varids` after expansion is what lets a token name a single input; the
+target override last means it lands on every replica.
+
+Scoping a run to one parameter therefore no longer needs a hand-written
+schema — `--varids 400.0.0@i --target 1` is the whole smoke test:
+
+```bash
+python3 trapSetter.py --device vip100g --varids 400.0.0@i --target 1 \
+    --hosts $IP --user root --password evertz --check
+```
 
 ---
 
 ## Reports
 
 The text report is written **always** (even on failure), plus optional JSON.
+
+By default it lands in **`logs/`** next to the script — anchored to the script's
+own directory, not the shell's cwd, so `python3 trap-config-setter/trapSetter.py`
+from a parent directory does not scatter timestamped reports across it, and the
+default behaves identically after the directory is copied to another machine.
+The directory is created on demand and its contents are gitignored.
+
+An explicit `--report`/`--json` path is used **exactly as given**, so it stays
+relative to your cwd — that is why the smoke-test commands above put their
+reports wherever they are run from. Either way the parent directory is created
+if missing, and both paths are resolved *before* the first request: a report
+path that cannot be written should fail in the first second, not after an
+11-minute `--ports 64` run has finished with nowhere to put its only record.
 Structure: run header (mode, params file, group counts, ports note, pacing knobs,
 parse warnings) → per-host listing grouped by group and, under expansion,
 sub-headed per port → `RECAP` table → `TOTAL` line → `RESULT`.

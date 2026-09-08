@@ -188,8 +188,12 @@ DEFAULT_PORT_OCTET = 1
 _TRUTHY = {"true", "t", "yes", "y", "on", "enable", "enabled", "1"}
 _FALSEY = {"false", "f", "no", "n", "off", "disable", "disabled", "0"}
 
-# Per-varid outcomes, ordered as the recap table prints them.
-STATUS_ORDER = ("ok", "changed", "would-change", "failed", "unresolved")
+# Per-varid outcomes, ordered as the recap table prints them. "skipped"
+# appears only in an interrupted run: the varid was never reached, which
+# must not be reported as "ok".
+STATUS_ORDER = (
+    "ok", "changed", "would-change", "failed", "unresolved", "skipped",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -827,7 +831,15 @@ class HostSession:
     # -- request pacing ----------------------------------------------------
 
     def _pace(self):
-        """Sleep out the remainder of the inter-request delay, if any."""
+        """Sleep out the remainder of the inter-request delay, if any.
+
+        Also the checkpoint at which a worker thread notices the run was
+        interrupted. KeyboardInterrupt is delivered to the main thread
+        only, so without this a --workers run would keep issuing requests
+        to every remaining host after Ctrl-C.
+        """
+        if self.setter.interrupted:
+            raise KeyboardInterrupt("run interrupted")
         if self._last_request is None:
             return
         remaining = self.setter.delay - (time.monotonic() - self._last_request)
@@ -986,6 +998,10 @@ class TrapSetter:
 
         self.progress = options.get("progress")
 
+        # Set once Ctrl-C has been seen. Read by _pace on worker threads,
+        # which never receive the signal themselves.
+        self.interrupted = False
+
         # Shared pooled session - keep-alive removes a TLS handshake per
         # request, which matters most here: this module makes ~30 sequential
         # requests to the same device.
@@ -1044,6 +1060,17 @@ class TrapSetter:
             # None on the cgi-bin path; the WebEasy version on a delegate path.
             # Reported so a fleet run shows which firmware each host resolved to.
             "webeasy_version": None,
+            # Which of the three phases was in flight. Names the point an
+            # interrupt landed, and distinguishes the read phase (nothing
+            # written yet) from the write phase.
+            "phase": None,
+            "interrupted": False,
+            "not_started": False,
+            # Varids that never reached a decision at all. Phase 1 builds
+            # no records until it completes, so an interrupt there leaves
+            # every varid unassessed - which must be stated, not counted
+            # as zero.
+            "pending": 0,
             "requests": 0,
             "elapsed_s": 0.0,
             "counts": Counter(),
@@ -1051,6 +1078,11 @@ class TrapSetter:
         }
 
         session = HostSession(self, host)
+
+        # Hoisted out of the try so the interrupt handler can still report
+        # on whatever the phases managed to decide.
+        records = []
+        written = set()
 
         try:
             session.open()
@@ -1060,10 +1092,12 @@ class TrapSetter:
 
             targets = self.traps
 
-            # Phase 1 - what does the device currently hold?
+            # Phase 1 - what does the device currently hold? This phase
+            # writes nothing, which is what makes an interrupt during it
+            # harmless to the device.
+            result["phase"] = "read"
             before = self._read(session, targets)
 
-            records = []
             to_write = []
 
             for trap in targets:
@@ -1111,10 +1145,12 @@ class TrapSetter:
                         record["status"] = "would-change"
             elif to_write:
                 # Phase 2 - write only what differs.
+                result["phase"] = "write"
                 set_outcomes = self._write(session, to_write)
 
                 # Phase 3 - re-read what was written. The device, not the RPC
                 # status, decides whether a write actually took.
+                result["phase"] = "verify"
                 after = self._read(session, to_write) if self.verify else {}
 
                 for trap, record in records:
@@ -1155,13 +1191,21 @@ class TrapSetter:
                         if set_error:
                             record["detail"] += "; set reported: %s" % set_error
 
-            for _trap, record in records:
-                if record["status"] is None:
-                    # Nothing to write and nothing read wrong - already correct.
-                    record["status"] = "ok"
-                result["traps"].append(record)
-                result["counts"][record["status"]] += 1
+            result["phase"] = "done"
 
+        except KeyboardInterrupt:
+            # Ctrl-C. Whatever was decided is kept: expansion is port-major
+            # so the inputs already reached are coherent, and that is only
+            # actionable if the report says where it stopped.
+            result["interrupted"] = True
+            phase = result["phase"] or "startup"
+            result["error"] = "interrupted during %s" % phase
+            if phase in ("startup", "read"):
+                # Phase 1 only reads, so there is nothing to be partway
+                # through. Say so rather than leaving it ambiguous.
+                result["error"] += "; no write was issued"
+            result["pending"] = max(0, len(self.traps) - len(records))
+            self.interrupted = True
         except RpcError as exc:
             result["reachable"] = False
             result["error"] = str(exc)
@@ -1169,6 +1213,28 @@ class TrapSetter:
             # One bad host must never take down the rest of the fleet run.
             result["reachable"] = False
             result["error"] = "%s: %s" % (type(exc).__name__, exc)
+
+        # Finalized outside the try so an interrupted host still reports.
+        # An unset status means "already correct" in a completed run but
+        # "never reached" in an interrupted one; calling the latter `ok`
+        # would claim a varid is converged without having looked at it.
+        # Skipped for an unreachable host, which has nothing to report.
+        if result["reachable"]:
+            for trap, record in records:
+                if record["status"] is None:
+                    if result["interrupted"]:
+                        record["status"] = "skipped"
+                        record["detail"] = (
+                            "write issued but not verified before the "
+                            "interrupt"
+                            if trap["varid"] in written
+                            else "not reached before the interrupt"
+                        )
+                    else:
+                        # Nothing to write, nothing read wrong - correct already.
+                        record["status"] = "ok"
+                result["traps"].append(record)
+                result["counts"][record["status"]] += 1
 
         result["requests"] = session.request_count
         result["elapsed_s"] = round(time.monotonic() - clock, 2)
@@ -1179,13 +1245,79 @@ class TrapSetter:
 
         return result
 
-    def run(self):
-        """Apply to every host. Returns the list of per-host results."""
-        if self.workers == 1:
-            return [self.run_host(host) for host in self.hosts]
+    def _not_started(self, host):
+        """Placeholder for a host the run never reached.
 
+        Recorded rather than omitted: an interrupted fleet run's recap must
+        still account for every host that was asked for, or a shortened
+        table reads as though the fleet were smaller than it is.
+        """
+        return {
+            "host": host,
+            "reachable": False,
+            "error": "not started (run interrupted)",
+            "not_started": True,
+            "interrupted": False,
+            "proto": None,
+            "endpoint": None,
+            "webeasy_version": None,
+            "phase": None,
+            "requests": 0,
+            "elapsed_s": 0.0,
+            "counts": Counter(),
+            "traps": [],
+            "started": None,
+            "pending": len(self.traps),
+        }
+
+    def run(self):
+        """Apply to every host. Returns the list of per-host results.
+
+        A KeyboardInterrupt never discards what completed: run_host absorbs
+        it for the host in flight, and the hosts after it are recorded as
+        not started.
+        """
+        results = []
+
+        if self.workers == 1:
+            for index, host in enumerate(self.hosts):
+                results.append(self.run_host(host))
+                if self.interrupted:
+                    results.extend(
+                        self._not_started(h)
+                        for h in self.hosts[index + 1:]
+                    )
+                    break
+            return results
+
+        # submit/as_completed rather than pool.map: map() propagates the
+        # interrupt and takes the completed results with it.
         with ThreadPoolExecutor(max_workers=self.workers) as pool:
-            return list(pool.map(self.run_host, self.hosts))
+            futures = OrderedDict(
+                (pool.submit(self.run_host, host), host)
+                for host in self.hosts
+            )
+            try:
+                for future in futures:
+                    future.result()
+            except KeyboardInterrupt:
+                # Setting the flag first is what lets the pool's
+                # shutdown-wait below return promptly: running workers
+                # abort at their next pacing checkpoint.
+                self.interrupted = True
+                for future in futures:
+                    future.cancel()
+
+        for future, host in futures.items():
+            if future.cancelled():
+                results.append(self._not_started(host))
+                continue
+            try:
+                results.append(future.result())
+            except BaseException:
+                results.append(self._not_started(host))
+
+        return results
 
 
 # ---------------------------------------------------------------------------
@@ -1247,6 +1379,10 @@ def render_text_report(run):
         )
     )
     lines.append("Ports        : %s" % meta["ports_note"])
+    if meta.get("varid_note"):
+        lines.append("Varids       : %s" % meta["varid_note"])
+    if meta.get("target_note"):
+        lines.append("Target       : %s" % meta["target_note"])
     lines.append("Hosts        : %d" % len(run["hosts"]))
     lines.append(
         "Chunk size   : %d    Delay: %.2fs    Workers: %d    Retries: %d"
@@ -1268,11 +1404,17 @@ def render_text_report(run):
     for result in run["hosts"]:
         rule("-")
         header = "HOST %s" % result["host"]
+        if result.get("not_started"):
+            lines.append("%s -- NOT STARTED (run interrupted)" % header)
+            lines.append("")
+            continue
         if not result["reachable"]:
             lines.append("%s -- UNREACHABLE" % header)
             lines.append("  error: %s" % result["error"])
             lines.append("")
             continue
+        if result.get("interrupted"):
+            header += " -- INTERRUPTED"
 
         lines.append(
             "%s  [%s%s]  %s"
@@ -1281,6 +1423,11 @@ def render_text_report(run):
         lines.append(
             "  %d requests in %.1fs" % (result["requests"], result["elapsed_s"])
         )
+        if result.get("interrupted"):
+            lines.append("  %s" % result["error"])
+            if result.get("pending"):
+                lines.append("  %d parameter(s) never assessed"
+                             % result["pending"])
         lines.append("")
 
         current_group = None
@@ -1345,19 +1492,23 @@ def render_text_report(run):
     lines.append("RECAP")
     rule()
     lines.append(
-        "%-24s %6s %8s %13s %7s %11s %6s"
-        % ("host", "ok", "changed", "would-change", "failed", "unresolved", "reqs")
+        "%-24s %6s %8s %13s %7s %11s %8s %6s"
+        % ("host", "ok", "changed", "would-change", "failed", "unresolved",
+           "skipped", "reqs")
     )
     for result in run["hosts"]:
         if not result["reachable"]:
             lines.append(
-                "%-24s %6s %8s %13s %7s %11s %6d   UNREACHABLE"
-                % (result["host"], "-", "-", "-", "-", "-", result["requests"])
+                "%-24s %6s %8s %13s %7s %11s %8s %6d   %s"
+                % (result["host"], "-", "-", "-", "-", "-", "-",
+                   result["requests"],
+                   "NOT STARTED" if result.get("not_started")
+                   else "UNREACHABLE")
             )
             continue
         counts = result["counts"]
         lines.append(
-            "%-24s %6d %8d %13d %7d %11d %6d"
+            "%-24s %6d %8d %13d %7d %11d %8d %6d%s"
             % (
                 result["host"],
                 counts.get("ok", 0),
@@ -1365,7 +1516,9 @@ def render_text_report(run):
                 counts.get("would-change", 0),
                 counts.get("failed", 0),
                 counts.get("unresolved", 0),
+                counts.get("skipped", 0),
                 result["requests"],
+                "   INTERRUPTED" if result.get("interrupted") else "",
             )
         )
 
@@ -1373,7 +1526,7 @@ def render_text_report(run):
     lines.append("")
     lines.append(
         "TOTAL  hosts=%d  unreachable=%d  ok=%d  changed=%d  would-change=%d  "
-        "failed=%d  unresolved=%d  requests=%d"
+        "failed=%d  unresolved=%d  skipped=%d  requests=%d"
         % (
             totals["hosts"],
             totals["unreachable"],
@@ -1382,9 +1535,16 @@ def render_text_report(run):
             totals["would-change"],
             totals["failed"],
             totals["unresolved"],
+            totals.get("skipped", 0),
             totals["requests"],
         )
     )
+    if totals.get("interrupted") or totals.get("not_started"):
+        lines.append(
+            "       interrupted=%d  not-started=%d  never-assessed=%d"
+            % (totals.get("interrupted", 0), totals.get("not_started", 0),
+               totals.get("pending", 0))
+        )
     lines.append("RESULT: %s" % run["meta"]["result"])
     lines.append("")
 
@@ -1400,14 +1560,24 @@ def summarize(run_hosts):
     """
     totals = Counter({status: 0 for status in STATUS_ORDER})
     totals["unreachable"] = 0
+    totals["interrupted"] = 0
+    totals["not_started"] = 0
+    totals["pending"] = 0
     totals["requests"] = 0
     totals["hosts"] = len(run_hosts)
 
     for result in run_hosts:
-        if not result["reachable"]:
+        if result.get("not_started"):
+            # Counted separately: a host that never ran is not the same
+            # finding as one that could not be reached.
+            totals["not_started"] += 1
+        elif not result["reachable"]:
             totals["unreachable"] += 1
+        if result.get("interrupted"):
+            totals["interrupted"] += 1
         for status, count in result["counts"].items():
             totals[status] += count
+        totals["pending"] += result.get("pending", 0)
         totals["requests"] += result["requests"]
     return totals
 
@@ -1423,6 +1593,33 @@ _PARAMS_EXTENSIONS = (".json", ".csv", ".txt")
 
 def params_dir():
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), "trap-params")
+
+
+def logs_dir():
+    """Where reports land when --report/--json are not given.
+
+    Anchored to the script's own directory, like params_dir(), rather than to
+    the process's cwd. The tool is normally invoked as
+    `python3 trap-config-setter/trapSetter.py` from a parent directory, and a
+    cwd-relative default scatters timestamped reports there instead of keeping
+    them with the tool - which is also what makes the default behave the same
+    after the directory is copied to another machine.
+    """
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+
+
+def _ensure_parent(path):
+    """Create the directory a report is about to be written into.
+
+    Returns the path, so it composes into the assignment. Called before the run
+    rather than at write time: a report path that cannot be created should fail
+    in the first second, not after an 11-minute --ports 64 run has completed
+    and has nowhere to put its only record.
+    """
+    parent = os.path.dirname(os.path.abspath(path))
+    if not os.path.isdir(parent):
+        os.makedirs(parent, exist_ok=True)
+    return path
 
 
 def resolve_params_path(args, prefer=_PARAMS_EXTENSIONS):
@@ -1500,9 +1697,22 @@ def build_parser():
              "applies the base varids only.",
     )
     source.add_argument(
+        "--varids",
+        help="comma/space-separated varids to apply, filtering the loaded "
+             "set after port expansion (e.g. 400.0.0@i,850.18@i). The "
+             "@suffix is optional. Scopes a run to a handful of parameters "
+             "without hand-writing a schema file.",
+    )
+    source.add_argument(
+        "--target", metavar="VALUE",
+        help="override every target value, in either direction: 0/1, "
+             "FALSE/TRUE, a number, or a string for an @s parameter. "
+             "Coerced per varid suffix, so one value suits a mixed set.",
+    )
+    source.add_argument(
         "--force-false", action="store_true",
-        help="override every target value to 0, ignoring the TRUE entries in "
-             "the params file",
+        help="alias for --target 0: override every target value to 0, "
+             "ignoring the TRUE entries in the params file",
     )
     source.add_argument(
         "--list", action="store_true",
@@ -1581,7 +1791,8 @@ def build_parser():
     output.add_argument(
         "--report",
         help="path for the text report (default: "
-             "trap-report-<device>-<timestamp>.txt)",
+             "logs/trap-report-<device>-<timestamp>.txt, alongside the "
+             "script). An explicit path is used as given.",
     )
     output.add_argument("--json", dest="json_report", help="path for a JSON report")
     output.add_argument(
@@ -1731,11 +1942,76 @@ def main(argv=None):
     warnings.extend(port_warnings)
 
     expanded_groups = sorted({t["group"] for t in traps if t.get("port")})
+    # Captured before --varids narrows the set: ports_note describes what
+    # expansion produced, and the separate Varids line describes the
+    # narrowing. Measuring the post-filter length here read as though
+    # expansion itself had produced 3 params.
+    expanded_count = len(traps)
 
-    if args.force_false:
+    # --varids runs after expansion so a token can name one specific input
+    # (400.31.0@i), and before the target override so the override lands on
+    # exactly the set that will be written.
+    varid_note = None
+    if args.varids:
+        wanted = [v for v in re.split(r"[,\s]+", args.varids) if v]
+        selected = []
+        matched = set()
         for trap in traps:
-            trap["target"] = 0
-            trap["target_raw"] = "FALSE (--force-false)"
+            address = trap["varid"].partition("@")[0]
+            for token in wanted:
+                # Accept the bare address too: typing the @suffix adds
+                # nothing, since the type is derived from the varid anyway.
+                if token in (trap["varid"], address):
+                    selected.append(trap)
+                    matched.add(token)
+                    break
+
+        missing = [v for v in wanted if v not in matched]
+        if missing:
+            parser.error(
+                "no parameter matches varid(s) %s; the loaded set holds %d "
+                "varid(s) - use --list to see them"
+                % (", ".join(missing), len(traps))
+            )
+
+        varid_note = "%d of %d selected by --varids" % (
+            len(selected), len(traps))
+        traps = selected
+
+        # Drop groups the filter emptied, so the report header and the
+        # group counts describe what will actually run.
+        groups = [g for g in groups
+                  if any(t["group"] == g for t in traps)]
+
+    if args.force_false and args.target is not None:
+        parser.error("--force-false and --target are mutually exclusive "
+                     "(--force-false is an alias for --target 0)")
+
+    override_raw = "0" if args.force_false else args.target
+    target_note = None
+    if override_raw is not None:
+        flag = "--force-false" if args.force_false else "--target"
+        # Coerced per suffix rather than once, so a single --target suits a
+        # set mixing @i and @s. A value no suffix can take is an error, not
+        # a silently skipped parameter.
+        rejected = []
+        for trap in traps:
+            value = _coerce_target(override_raw, trap["suffix"])
+            if value is None:
+                rejected.append("%s (@%s)" % (trap["varid"], trap["suffix"]))
+                continue
+            trap["target"] = value
+            trap["target_raw"] = "%s (%s)" % (override_raw, flag)
+
+        if rejected:
+            parser.error(
+                "%s %r is not a usable value for %d varid(s), e.g. %s"
+                % (flag, override_raw, len(rejected),
+                   ", ".join(rejected[:3]))
+            )
+
+        target_note = "every target overridden to %r by %s" % (
+            override_raw, flag)
 
     group_counts = OrderedDict()
     for group in groups:
@@ -1744,7 +2020,8 @@ def main(argv=None):
     ports_note = "not expanded (base varids only)"
     if expanded_groups:
         ports_note = "%d per input; %s expanded from %d to %d params" % (
-            port_count, ", ".join(expanded_groups), base_count, len(traps),
+            port_count, ", ".join(expanded_groups), base_count,
+            expanded_count,
         )
 
     if args.list:
@@ -1779,15 +2056,27 @@ def main(argv=None):
         print("note: --chunk-size %d capped to %d to protect the WebEasy server"
               % (args.chunk_size, MAX_CHUNK_SIZE), file=sys.stderr)
 
+    # Both output paths are resolved and their directories created up front,
+    # before a single request goes out. An explicit --report/--json is honoured
+    # exactly as given (so it stays relative to the operator's cwd); only the
+    # default lands in logs/.
+    report_path = _ensure_parent(args.report or os.path.join(
+        logs_dir(),
+        "trap-report-%s-%s.txt" % (args.device, time.strftime("%Y%m%d-%H%M%S")),
+    ))
+    if args.json_report:
+        _ensure_parent(args.json_report)
+
     def progress(result):
         if args.quiet:
             return
         if not result["reachable"]:
             print("%-24s UNREACHABLE  %s" % (result["host"], result["error"]))
         else:
-            print("%-24s %s  (%d requests, %.1fs)"
+            print("%-24s %s  (%d requests, %.1fs)%s"
                   % (result["host"], _recap_counts(result),
-                     result["requests"], result["elapsed_s"]))
+                     result["requests"], result["elapsed_s"],
+                     "  INTERRUPTED" if result.get("interrupted") else ""))
 
     setter = TrapSetter(
         hosts,
@@ -1825,13 +2114,31 @@ def main(argv=None):
 
     started = time.time()
     clock = time.monotonic()
-    results = setter.run()
+    try:
+        results = setter.run()
+    except KeyboardInterrupt:
+        # run() absorbs an interrupt that lands inside a host; this is the
+        # backstop for one that lands between them. Either way the report
+        # below is still written - losing a long run's only record to a
+        # Ctrl-C is the whole failure this guards against.
+        setter.interrupted = True
+        results = []
     duration = time.monotonic() - clock
 
     totals = summarize(results)
-    failed = totals["failed"] + totals["unresolved"] + totals["unreachable"]
+    failed = (totals["failed"] + totals["unresolved"]
+              + totals["unreachable"] + totals["interrupted"]
+              + totals["not_started"])
 
-    if args.check:
+    if setter.interrupted:
+        result_line = (
+            "INTERRUPTED - %d varid(s) at target, %d skipped, %d never "
+            "assessed, %d host(s) incomplete"
+            % (totals["ok"] + totals["changed"], totals["skipped"],
+               totals["pending"],
+               totals["interrupted"] + totals["not_started"])
+        )
+    elif args.check:
         result_line = (
             "CHECK ONLY - %d varid(s) would change, %d already correct, "
             "%d problem(s)"
@@ -1857,6 +2164,10 @@ def main(argv=None):
             "base_trap_count": base_count,
             "port_count": port_count,
             "ports_note": ports_note,
+            "varid_note": varid_note,
+            "target_note": target_note,
+            "varids_filter": args.varids,
+            "target_override": override_raw,
             "expanded_groups": expanded_groups,
             "chunk_size": setter.chunk_size,
             "delay": setter.delay,
@@ -1874,9 +2185,6 @@ def main(argv=None):
         "totals": dict(totals),
     }
 
-    report_path = args.report or "trap-report-%s-%s.txt" % (
-        args.device, time.strftime("%Y%m%d-%H%M%S")
-    )
     report_text = render_text_report(run)
     with open(report_path, "w") as handle:
         handle.write(report_text)
@@ -1894,7 +2202,7 @@ def main(argv=None):
         if args.json_report:
             print("json  : %s" % os.path.abspath(args.json_report))
 
-    return 1 if failed else 0
+    return 1 if failed or setter.interrupted else 0
 
 
 if __name__ == "__main__":

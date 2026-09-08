@@ -1,0 +1,26 @@
+{
+  "device": "probe-ports",
+  "source": "hand-written",
+  "comment": "P0-4 port-octet fixture: the four video params at display ports 1, 32 and 64 (octets 0, 31, 63). Varids match what expand_ports emits for --ports 64, verified with --list, so this applies to three inputs at the extremes of the range without writing all 64. Names follow the expansion convention so reports are comparable. port_count stays null - the varids are already explicit.",
+  "port_count": null,
+  "param_count": 12,
+  "groups": {
+    "video": {
+      "target": 0,
+      "params": {
+        "Loss of Video (port 1)": "400.0.0@i",
+        "Video Frozen (port 1)": "400.0.1@i",
+        "Video Black (port 1)": "400.0.2@i",
+        "Motion Detected (port 1)": "400.0.3@i",
+        "Loss of Video (port 32)": "400.31.0@i",
+        "Video Frozen (port 32)": "400.31.1@i",
+        "Video Black (port 32)": "400.31.2@i",
+        "Motion Detected (port 32)": "400.31.3@i",
+        "Loss of Video (port 64)": "400.63.0@i",
+        "Video Frozen (port 64)": "400.63.1@i",
+        "Video Black (port 64)": "400.63.2@i",
+        "Motion Detected (port 64)": "400.63.3@i"
+      }
+    }
+  }
+}

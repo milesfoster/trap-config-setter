@@ -12,8 +12,12 @@ Endpoint discovery (`_check_endpoint`) and the auth path it selects. This is
 the transport decision trapSetter duplicates from ptpMon, so it is the one most
 likely to drift: it was pinned to WebEasy 1.5 alone until 2026-09-04, which
 made every 1.6 device unreachable. These tests are the regression guard on that
-table, and matter more than usual because `extras/` is gitignored and this code
-has no git history to fall back on.
+table.
+
+`--varids` / `--target` (PLAN.md P1-4) and interrupt handling (P2-1). The
+interrupt tests matter most: the finalize loop in `run_host` moved out of the
+try block to make them possible, and the failure they guard against is silent -
+an unexamined varid reported as `ok` would read as a converged fleet.
 
 Still wanted (PLAN.md P3-1): `_coerce_target`, `_to_comparable`, `parse_export`,
 `expand_ports`, `detect_per_port`, `map_response`, and the export ->
@@ -307,6 +311,309 @@ class HostRecordTests(unittest.TestCase):
         setter.session = FakeSession([], raise_on=(CGI,))
         result = setter.run_host("10.0.0.1")
         self.assertIn("webeasy_version", result)
+
+
+# ---------------------------------------------------------------------------
+# P1-4: --varids and --target
+# ---------------------------------------------------------------------------
+
+def run_cli(argv):
+    """main() with stdout captured. Returns (exit_code, stdout)."""
+    buffer = io.StringIO()
+    with contextlib.redirect_stdout(buffer):
+        code = ts.main(argv)
+    return code, buffer.getvalue()
+
+
+def cli_stderr(testcase, argv):
+    """main() expected to exit via parser.error. Returns stderr."""
+    buffer = io.StringIO()
+    with contextlib.redirect_stderr(buffer):
+        with testcase.assertRaises(SystemExit):
+            ts.main(argv)
+    return buffer.getvalue()
+
+
+class VaridFilterTests(unittest.TestCase):
+    """--varids scopes a run without hand-writing a schema file."""
+
+    def test_selects_by_full_varid(self):
+        code, out = run_cli(["--device", "vip100g", "--varids", "400.0.0@i",
+                             "--list"])
+        self.assertEqual(code, 0)
+        self.assertIn("400.0.0@i", out)
+        self.assertNotIn("400.0.1@i", out)
+
+    def test_selects_by_bare_address(self):
+        # The @suffix adds nothing - the type is derived from the varid.
+        code, out = run_cli(["--device", "vip100g", "--varids", "850.18",
+                             "--list"])
+        self.assertEqual(code, 0)
+        self.assertIn("850.18@i", out)
+
+    def test_selects_across_groups(self):
+        code, out = run_cli(["--device", "vip100g", "--varids",
+                             "400.0.0@i,850.18@i", "--list"])
+        self.assertEqual(code, 0)
+        self.assertIn("400.0.0@i", out)
+        self.assertIn("850.18@i", out)
+
+    def test_space_separated_is_accepted(self):
+        code, out = run_cli(["--device", "vip100g", "--varids",
+                             "400.0.0@i 850.18@i", "--list"])
+        self.assertEqual(code, 0)
+        self.assertIn("850.18@i", out)
+
+    def test_matches_an_expanded_input(self):
+        # Runs after expansion, so a token can name one specific input. This is
+        # the case a pre-expansion filter could not serve.
+        code, out = run_cli(["--device", "vip100g", "--ports", "64",
+                             "--varids", "400.31.0@i", "--list"])
+        self.assertEqual(code, 0)
+        self.assertIn("400.31.0@i", out)
+        self.assertIn("port 32", out)
+
+    def test_empties_groups_are_dropped_from_the_header(self):
+        code, out = run_cli(["--device", "vip100g", "--varids", "400.0.0@i",
+                             "--list"])
+        self.assertEqual(code, 0)
+        self.assertIn("across video", out.splitlines()[0])
+        self.assertNotIn("audio", out.splitlines()[0])
+
+    def test_unknown_varid_is_an_error(self):
+        # Silently selecting nothing would be the worst outcome here: the run
+        # would report a clean SUCCESS having written nothing.
+        message = cli_stderr(self, ["--device", "vip100g", "--varids",
+                                    "400.0.99@i", "--list"])
+        self.assertIn("400.0.99@i", message)
+
+    def test_unknown_varid_named_alongside_a_good_one(self):
+        message = cli_stderr(self, ["--device", "vip100g", "--varids",
+                                    "400.0.0@i,999.9.9@i", "--list"])
+        self.assertIn("999.9.9@i", message)
+        self.assertNotIn("400.0.0@i;", message)
+
+
+class TargetOverrideTests(unittest.TestCase):
+    """--target overrides the schema target in either direction."""
+
+    def _targets(self, argv):
+        code, out = run_cli(argv)
+        self.assertEqual(code, 0)
+        return out
+
+    def test_overrides_to_true(self):
+        # vip100g's video group targets 0; --target 1 must win.
+        out = self._targets(["--device", "vip100g", "--varids", "400.0.0@i",
+                             "--target", "1", "--list"])
+        self.assertIn("-> 1", out)
+
+    def test_accepts_the_exports_own_wording(self):
+        out = self._targets(["--device", "vip100g", "--varids", "400.0.0@i",
+                             "--target", "TRUE", "--list"])
+        self.assertIn("-> 1", out)
+
+    def test_overrides_to_false(self):
+        # system targets 1; --target 0 must win.
+        out = self._targets(["--device", "vip100g", "--varids", "850.18@i",
+                             "--target", "0", "--list"])
+        self.assertIn("-> 0", out)
+
+    def test_force_false_is_an_alias_for_target_0(self):
+        alias = self._targets(["--device", "vip100g", "--varids", "850.18@i",
+                               "--force-false", "--list"])
+        explicit = self._targets(["--device", "vip100g", "--varids", "850.18@i",
+                                  "--target", "0", "--list"])
+        self.assertEqual(
+            [line.split("->")[1] for line in alias.splitlines() if "->" in line],
+            [line.split("->")[1] for line in explicit.splitlines() if "->" in line],
+        )
+
+    def test_conflicting_flags_are_rejected(self):
+        message = cli_stderr(self, ["--device", "vip100g", "--target", "1",
+                                    "--force-false", "--list"])
+        self.assertIn("mutually exclusive", message)
+
+    def test_unusable_value_is_an_error_not_a_skip(self):
+        message = cli_stderr(self, ["--device", "vip100g", "--varids",
+                                    "400.0.0@i", "--target", "junk", "--list"])
+        self.assertIn("not a usable value", message)
+
+
+# ---------------------------------------------------------------------------
+# P2-1: surviving Ctrl-C with a report
+# ---------------------------------------------------------------------------
+
+def make_traps(count, group="video", target=0):
+    """A minimal trap set in the shape load_schema produces."""
+    return [
+        {
+            "name": "param %d" % index, "group": group,
+            "varid": "400.0.%d@i" % index, "fault_varid": "",
+            "suffix": "i", "type": "integer",
+            "target": target, "target_raw": str(target), "line": None,
+            "per_port": False, "port_octet": 1, "port": None,
+        }
+        for index in range(count)
+    ]
+
+
+class InterruptingSetter(ts.TrapSetter):
+    """A setter whose phases raise KeyboardInterrupt on demand.
+
+    Ctrl-C cannot be delivered from a test, so the phases stand in for it: the
+    interrupt surfaces from exactly where a real one would, inside _read or
+    _write while a request is in flight.
+    """
+
+    def __init__(self, hosts, traps, interrupt_at=None, current=1, **options):
+        ts.TrapSetter.__init__(self, hosts, traps, **options)
+        self.interrupt_at = interrupt_at
+        self.current = current
+        self.reads = 0
+
+    def _read(self, session, traps):
+        self.reads += 1
+        phase = "read" if self.reads == 1 else "verify"
+        if self.interrupt_at == phase:
+            raise KeyboardInterrupt()
+        return dict(
+            (t["varid"], {"value": self.current, "error": None}) for t in traps
+        )
+
+    def _write(self, session, traps):
+        if self.interrupt_at == "write":
+            raise KeyboardInterrupt()
+        return dict(
+            (t["varid"], {"value": t["target"], "error": None}) for t in traps
+        )
+
+
+class InterruptTests(unittest.TestCase):
+    """An interrupted run must still report, and must not claim `ok`."""
+
+    def setUp(self):
+        # Discovery is covered elsewhere; stub it so no socket is opened.
+        self._real_open = ts.HostSession.open
+
+        def fake_open(session):
+            session.proto = "https"
+            session.endpoint = V15
+            session.webeasy_version = "1.5"
+
+        ts.HostSession.open = fake_open
+
+    def tearDown(self):
+        ts.HostSession.open = self._real_open
+
+    def _run(self, interrupt_at, hosts=("10.0.0.1",), count=4, current=1):
+        setter = InterruptingSetter(
+            list(hosts), make_traps(count), interrupt_at=interrupt_at,
+            current=current, delay=0,
+        )
+        return setter, setter.run()
+
+    def test_interrupt_marks_the_host(self):
+        _setter, results = self._run("write")
+        self.assertTrue(results[0]["interrupted"])
+
+    def test_interrupted_host_is_not_reported_unreachable(self):
+        # It answered; it just did not finish. Conflating the two would send an
+        # operator looking for a network fault.
+        _setter, results = self._run("write")
+        self.assertTrue(results[0]["reachable"])
+
+    def test_interrupt_sets_the_setter_flag(self):
+        setter, _results = self._run("write")
+        self.assertTrue(setter.interrupted)
+
+    def test_read_phase_interrupt_says_nothing_was_written(self):
+        # Phase 1 only reads, so there is nothing to be partway through.
+        _setter, results = self._run("read")
+        self.assertIn("no write was issued", results[0]["error"])
+
+    def test_write_phase_interrupt_does_not_claim_nothing_was_written(self):
+        _setter, results = self._run("write")
+        self.assertNotIn("no write was issued", results[0]["error"])
+
+    def test_error_names_the_phase(self):
+        _setter, results = self._run("verify")
+        self.assertIn("verify", results[0]["error"])
+
+    def test_unreached_varids_are_skipped_not_ok(self):
+        # The whole point: calling an unexamined varid `ok` would report a
+        # fleet as converged without having looked at it.
+        _setter, results = self._run("write")
+        statuses = set(t["status"] for t in results[0]["traps"])
+        self.assertEqual(statuses, set(["skipped"]))
+
+    def test_skipped_varids_say_a_write_may_have_gone_out(self):
+        _setter, results = self._run("write")
+        self.assertIn("not verified", results[0]["traps"][0]["detail"])
+
+    def test_completed_run_still_reports_ok(self):
+        # Regression guard: the finalize loop moved out of the try block, and
+        # must behave exactly as before when nothing is interrupted.
+        setter = InterruptingSetter(
+            ["10.0.0.1"], make_traps(4, target=1), current=1, delay=0,
+        )
+        results = setter.run()
+        self.assertEqual(
+            set(t["status"] for t in results[0]["traps"]), set(["ok"]),
+        )
+        self.assertFalse(results[0]["interrupted"])
+
+    def test_remaining_hosts_are_recorded_as_not_started(self):
+        # Omitting them would silently shorten the recap.
+        _setter, results = self._run("write", hosts=("a", "b", "c"))
+        self.assertEqual(len(results), 3)
+        self.assertTrue(results[1]["not_started"])
+        self.assertTrue(results[2]["not_started"])
+
+    def test_not_started_hosts_are_not_counted_unreachable(self):
+        _setter, results = self._run("write", hosts=("a", "b"))
+        totals = ts.summarize(results)
+        self.assertEqual(totals["not_started"], 1)
+        self.assertEqual(totals["unreachable"], 0)
+
+    def test_totals_count_interrupted_hosts(self):
+        _setter, results = self._run("write", hosts=("a", "b"))
+        self.assertEqual(ts.summarize(results)["interrupted"], 1)
+
+    def test_report_renders_an_interrupted_run(self):
+        _setter, results = self._run("write", hosts=("a", "b"))
+        text = ts.render_text_report({
+            "meta": {
+                "started": "-", "finished": "-", "duration_s": 0.0,
+                "mode": "apply", "params_file": "-", "groups": ["video"],
+                "group_counts": {"video": 4}, "trap_count": 4,
+                "ports_note": "-", "chunk_size": 10, "delay": 0.0,
+                "workers": 1, "retries": 1, "verify": True, "set_all": False,
+                "warnings": [], "brief": False, "result": "INTERRUPTED",
+            },
+            "hosts": results,
+            "totals": dict(ts.summarize(results)),
+        })
+        self.assertIn("INTERRUPTED", text)
+        self.assertIn("NOT STARTED", text)
+        self.assertIn("skipped", text)
+
+
+class StatusVocabularyTests(unittest.TestCase):
+    """The JSON report's shape must stay stable as statuses are added."""
+
+    def test_skipped_is_in_the_status_order(self):
+        self.assertIn("skipped", ts.STATUS_ORDER)
+
+    def test_summarize_seeds_every_status(self):
+        totals = ts.summarize([])
+        for status in ts.STATUS_ORDER:
+            self.assertEqual(totals[status], 0)
+
+    def test_summarize_seeds_the_host_level_keys(self):
+        totals = ts.summarize([])
+        for key in ("unreachable", "interrupted", "not_started", "requests"):
+            self.assertEqual(totals[key], 0)
 
 
 if __name__ == "__main__":

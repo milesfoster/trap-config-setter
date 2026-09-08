@@ -1,0 +1,22 @@
+{
+  "device": "probe4",
+  "source": "hand-written",
+  "comment": "P0-2 mixed-outcome smoke test: the four video varids plus one deliberately invalid index (400.0.99@i), placed third so it sits mid-chunk. The group target is 0 with a target_override keeping Motion Detected at 1, so a single run produces changed + ok + unresolved together. port_count stays null so nothing expands.",
+  "port_count": null,
+  "param_count": 5,
+  "groups": {
+    "video": {
+      "target": 0,
+      "target_overrides": {
+        "Motion Detected": 1
+      },
+      "params": {
+        "Loss of Video": "400.0.0@i",
+        "Video Frozen": "400.0.1@i",
+        "BOGUS index 99": "400.0.99@i",
+        "Video Black": "400.0.2@i",
+        "Motion Detected": "400.0.3@i"
+      }
+    }
+  }
+}

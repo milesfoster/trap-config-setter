@@ -2,7 +2,8 @@
 
 ## Where we are
 
-The tool is feature-complete offline and unproven online.
+The write path is proven on hardware. P0-1 and P0-2 both passed against a
+vip100g on 2026-09-08; what remains in P0 is scale, not viability.
 
 **Done and verified without a device:**
 
@@ -15,67 +16,148 @@ The tool is feature-complete offline and unproven online.
 - Endpoint discovery: cgi-bin first, then WebEasy 1.6/1.5 newest-first, with
   `--webeasy-version` to pin (P1-1, verified against a mocked transport).
 
-**Never executed:** the `set` RPC. Everything downstream of it — the phase-2/3
-write-verify loop, the `changed`/`failed` distinction, the cookie-replay retry,
-delegate Basic auth — has only ever run against the code, not a device.
+**Verified on hardware (2026-09-08, 172.17.223.93, WebEasy 1.5):** protocol
+and endpoint discovery, delegate Basic auth, `get`, `set` in both directions,
+the phase-2/3 write-verify loop, the `ok` / `changed` / `would-change` /
+`unresolved` statuses, idempotence, `target_overrides`, chunking with mixed
+outcomes, and exit status.
 
-That is the gate. Nothing below P0 is worth building until P0 answers.
+**Still never executed:** the `cfgjsonrpc` cookie-login path's *write*
+behaviour (that device resolved to the delegate endpoint — see P1-2), the
+`failed` status, the cookie-replay retry, and any apply wider than 12
+varids. The widest *read* so far is 256.
+
+The gate is open.
 
 ---
 
 ## P0 — Hardware validation
 
-### P0-1. One varid, both directions
+### P0-1. One varid, both directions — **PASSED (2026-09-08)**
 
-Run the five-step sequence in
-[README.md → Single-varid smoke test](README.md#single-varid-smoke-test) against
-a single lab vip100g. It uses `trap-params/probe.json` (`400.0.0@i`, Loss of
-Video, input 1) and covers: discovery → auth → `get` → `set 1` → UI
-confirmation → `set 0` → converged re-check.
+Ran against 172.17.223.93 with `trap-params/probe.json` (`400.0.0@i`, Loss of
+Video, input 1). Reports in `logs/probe-check.*`, `logs/probe-set-0.*`,
+`logs/probe-set-1.*`.
 
-Record, from `probe-set-1.json`:
+The README sequence needed **reversing**: the varid already held 1, so "set it
+to 1" was a no-op that phase 1 skipped, proving nothing about `set`. Ran
+`--force-false` first (a genuine `1 -> 0` write), confirmed the UI had gone
+unticked, then restored it. README now documents this.
 
-| What | Why it matters |
+| What | Recorded |
 |---|---|
-| `proto`, `endpoint` | Which of the two auth paths this firmware takes. Both need proving; a lab with only one generation proves only half. |
-| `requests` | Should be exactly 3 (get, set, verify get). More means a retry fired. |
-| `before` / `after` | The read-back is the whole basis of the `changed` status. |
-| exact `set` reply shape | Feeds P1-3. Capture the raw JSON if it deviates. |
+| `proto`, `endpoint` | `https`, `/v.1.5/php/datas/cfgjsonrpc.php` — the **delegate/Basic-auth** path, so the cgi-bin cookie path is still unproven (P1-2). |
+| `webeasy_version` | `1.5` |
+| `requests` | Exactly **3** on both writes. No retry fired. |
+| `before` / `after` | `1 -> 0`, then `0 -> 1`. Both confirmed by the phase-3 read-back, and independently by a raw `get` issued outside the tool. |
+| `set` reply shape | `{"id":"400.0.0@i","status":"success","type":"integer","value":1}` — note the `status` field, which `map_response` ignores (P1-3). |
 
-**Pass:** step 2 reports `changed`, the UI agrees, step 5 reports `ok`.
+Step 5's converged re-check reported `ok` in **1 request with zero writes**, so
+idempotence holds on real hardware.
 
-### P0-2. One chunk, mixed outcomes
+Also settled: the 0/1 mapping is **not** inverted — the one bug class a report
+full of green `changed` rows would happily hide. `--force-false` asked for `0`,
+the device read back `0`, and the UI went unticked: three independent
+agreements.
 
-Extend the probe schema to ~12 varids, deliberately including one that does not
-exist on this firmware (a bogus index). This is the first test of behaviour the
-single-varid case cannot reach:
+### P0-2. One chunk, mixed outcomes — **PASSED (2026-09-08)**
 
-- Chunking at the boundary (12 params → 2 requests of 10 + 2).
-- `unresolved` vs `failed` — does the device error the one bad varid, or reject
-  the whole chunk? If the latter, one missing notify row poisons nine good ones
-  and chunking needs a fallback-to-singles retry.
-- Whether `set` replies echo `id` per parameter (P1-3).
+Done with **5 varids, not 12**: the four video params plus one bogus index
+(`400.0.99@i`) placed *third* so it sat mid-chunk, as
+`trap-params/probe4.json`. Chunking was exercised with `--chunk-size 2` (3
+chunks) instead of padding the schema out to cross the default boundary.
+Reports in `logs/probe4-*`.
 
-### P0-3. Full device, check then apply
+`ok=1 changed=3 unresolved=1`, reconciling to 5, in **7 requests** (3 phase-1 +
+2 phase-2 + 2 phase-3, so no retries):
 
-`--check` the full 95-param `vip100g` schema, read the report, then apply.
-Confirm the recap totals reconcile and that a second apply is a no-op
-(`ok=95`, zero writes).
+```
+[changed     ] Loss of Video      400.0.0@i   1 -> 0
+[changed     ] Video Frozen       400.0.1@i   1 -> 0
+[unresolved  ] BOGUS index 99     400.0.99@i  - (want 0)  (read failed: Failed to process request)
+[changed     ] Video Black        400.0.2@i   1 -> 0
+[ok          ] Motion Detected    400.0.3@i   1
+```
 
-### P0-4. Expansion, one host
+- **No chunk poisoning.** The bad varid shared a chunk with Video Black and did
+  not disturb it, in either the read or the write. **The fallback-to-singles
+  retry is not needed** — that contingency is dropped.
+- **`unresolved` behaves as designed:** read error, write skipped, stated in
+  the report, exit 1.
+- **`set` replies do echo `id` per parameter**, errored entries included (P1-3).
+- `target_overrides` exercised on hardware for the first time — it is what
+  held Motion Detected at 1, producing an `ok` alongside the `changed` rows.
 
-`--ports 64 --check` on one host, `--brief`. Two things to watch:
+State was restored to its pre-test values afterwards, confirmed by a read
+issued outside the tool.
 
-- **Wall clock** against the banner's estimate. 4379 params ≈ 438 requests in
-  check mode, ~4 minutes at 0.5s. If the device's real response time dominates
-  the pacing delay, the estimate is wrong and `--delay` guidance needs revising.
-- **Device health during and after** — CPU, web UI responsiveness. The chunk cap
-  of 10 and the 0.5s delay are assumptions, not measurements. This is the run
-  that turns them into measurements.
+**Still not produced on hardware: `failed`.** It is reachable only via a verify
+mismatch or a rejected `set`. A `--set-all` run over `probe4.json` would force
+it, since that writes the bogus varid instead of skipping it, and would confirm
+`unresolved` becomes `failed`.
 
-Then apply to one host and spot-check three inputs in the UI (1, 32, 64) to
-prove the port-octet arithmetic is right on real hardware and not just in the
-collision checker.
+### P0-3. Full device, check then apply — **CHECK PASSED (2026-09-08)**
+
+`ok=17 would-change=68 unresolved=10`, reconciling to 95, in 10 requests /
+5.8s. Report in `logs/p03-check.*`. The recap totals reconcile.
+
+The 10 `unresolved` are **absent hardware, not tool error**: Main Port 2 and
+Backup Port 2 (`340.0.1.*`, `340.1.1.*`) and Fans J30-J35 (`850.12`-`850.17`).
+This frame has one port per main/backup and only fans J28/J29. All 17 `ok`
+are system traps already at 1; all 68 `would-change` are video/audio at 1
+against a target of 0.
+
+**The apply half was deliberately not run** (instructed to check only), so
+*a second apply is a no-op* is still unverified. That is the only part of
+P0-3 outstanding.
+
+### P0-4. Expansion, one host — **PASSED, 3 ports (2026-09-08)**
+
+Scoped to display ports **1, 32 and 64** rather than all 64, via
+`trap-params/probe-ports.json`. Ports 1-3 (`--ports 3`) were rejected as the
+scope: they exercise only octets 0-2 and miss the high end, which is the
+whole point. Reports in `logs/p04-*`.
+
+| What | Result |
+|---|---|
+| Expansion arithmetic | `--ports 64 --list` emits `400.0.*` / `400.31.*` / `400.63.*` for display ports 1/32/64, matching varids read independently — so the fixture tests `expand_ports`, not hand arithmetic. |
+| All 64 inputs resolve | read-only check of all **256** expanded video varids: `would-change=256`, **zero unresolved**. |
+| Wall clock | 26 requests in 14.8s against the banner's >= 13s. Device response adds ~0.07s/request, so **the pacing estimate holds** and `--delay` guidance stands. A full 4379-param apply extrapolates to ~12.5 min vs the documented ~11. |
+| Apply | 12 varids across ports 1/32/64: `changed=12`, 6 requests, exit 0. |
+| Collateral | **none** — neighbours 2, 31, 33, 63 all still at 1 after the write. |
+
+UI spot-check confirmed inputs 1 and 32. Input 64 is not reachable in this
+unit's UI, so the arithmetic is UI-confirmed to 32 and API-confirmed to 64.
+State was restored to pre-test values afterwards.
+
+**Not measured:** device CPU and web-UI responsiveness during the run. The
+chunk cap of 10 and the 0.5s delay remain assumptions; only the *pacing
+estimate* was turned into a measurement, not the load ceiling.
+
+#### Firmware observation: the port octet is capacity, not population
+
+This test unit has **32 physical inputs**, but the API accepted, stored and
+read back a write to `400.63.0@i` (display input 64). An octet sweep pins the
+behaviour down:
+
+```
+port octet  (2nd)   valid 0-63,  errors from 64   -> family capacity, 64 inputs
+index octet (3rd)   valid 0-3,   errors from 4    -> the 4 video params
+```
+
+So for a per-port group, *does this varid resolve?* answers **is it within
+capacity**, not *is it physically present*. Chassis groups are the opposite:
+P0-3's absent fans and ports resolved as `unresolved` precisely because they
+reflect population. One rule does not cover both.
+
+The consequence is that `--ports 64` on a 32-port card would report
+`SUCCESS` with `changed=2048`, half of it phantom, and the three-phase
+design cannot catch it: phase 3 re-reads the same storage the write went
+into and correctly confirms the value.
+
+**Decided: left as is, no guard.** trapSetter is a power-user tool and the
+operator is expected to check the frame's port indices before an apply.
+Recorded here so it is not rediscovered on a 32-port card.
 
 ---
 
@@ -118,6 +200,13 @@ calls `get`.
 `set` may well require an authenticated session. If P0-1 step 2 reads cleanly and
 then fails to verify, this is why.
 
+**P0-1 did not exercise this.** 172.17.223.93 resolved to the delegate
+endpoint, so it authenticated with per-request Basic auth and never called
+`_login` at all. Proving this path needs an older-generation frame that answers
+on `/cgi-bin/cfgjsonrpc`. Until one is available the write path is validated
+for delegate firmware only — **not fleet-wide**, and P0-1 should not be read
+as saying otherwise.
+
 **Fix if needed:** POST credentials to `login.php` (or call the RPC `login`
 method — CLAUDE.md describes ptpMon as doing this, though the code does not, so
 the service likely exposes it) before the first `set`. Keep it conditional: an
@@ -133,18 +222,52 @@ attributed to the wrong varid — which under `set` means a report that names th
 wrong parameter as failed.
 
 **Fix:** only use the positional fallback when
-`len(parameters) == len(sent)`; otherwise mark the unattributable entries against
-the chunk as a whole. P0-2 tells us which shape the device actually emits.
+`len(parameters) == len(sent)`; otherwise mark the unattributable entries
+against the chunk as a whole.
 
-### P1-4. `--varids` flag
+**P0-2 answered the shape question: this is not triggered on WebEasy 1.5.**
+Every entry echoes its `id`, errored ones included, and replies arrive one per
+sent parameter in order — so the fallback is unreachable there, and would
+attribute correctly even if reached. The fix is still worth having as defence
+against other firmware, but it is no longer urgent and should not be written
+blind against a shape no device has emitted. Deferred.
 
-P0 needs a one-parameter run and the answer today is a hand-written schema file.
-That is fine once, awkward as a habit.
+One related gap P0-2 did surface: `map_response` reads only `value` and
+`error`, ignoring the `status` field that `set` replies carry, so a
+non-success `status` with no `error` key would read as clean. Phase 3's
+read-back catches it, which is exactly the design rationale — a note, not a
+bug.
 
-**Fix:** `--varids 400.0.0@i,850.18@i` filtering the loaded set after expansion,
-plus `--target N` to override the schema target in either direction (`--force-false`
-becomes `--target 0`, kept as an alias). Small, and it makes every future
-debugging session a one-liner.
+### P1-4. `--varids` flag — **DONE (2026-09-08)**
+
+`--varids 400.0.0@i,850.18@i` filters the loaded set **after** expansion, and
+`--target VALUE` overrides the schema target in either direction.
+`--force-false` is now an alias for `--target 0` and is refused alongside it.
+
+Details that matter:
+
+- **Filtering after expansion** is what lets a token name one input
+  (`400.31.0@i`). A pre-expansion filter could not.
+- **The bare address is accepted** (`850.18`), since the `@suffix` adds
+  nothing — the type is derived from the varid anyway.
+- **An unmatched varid is an error.** Silently selecting nothing would be the
+  worst outcome available: the run would report a clean `SUCCESS` having
+  written nothing at all.
+- **`--target` is coerced per suffix**, not once, so one value suits a set
+  mixing `@i` and `@s`. A value no suffix can take is an error rather than a
+  quietly skipped parameter.
+- Groups the filter empties are dropped from the report header, and
+  `ports_note` reports what *expansion* produced (95 → 4379) with the
+  narrowing stated separately (`3 of 4379 selected by --varids`). Measuring
+  the post-filter length there read as though expansion had produced 3.
+
+Verified on 172.17.223.93: `--ports 64 --varids 400.0.0@i,400.31.0@i,850.18@i`
+selects 3 of 4379 and runs in one request (`logs/p14-varids.*`). 16 unit
+tests.
+
+This replaces the hand-written probe schema as the way to scope a run, though
+`probe.json` / `probe4.json` / `probe-ports.json` are kept as documented
+fixtures.
 
 ### P1-5. Retry loop retries the unretryable
 
@@ -160,15 +283,50 @@ other than 401/403 (which get exactly one re-login, as now).
 
 These matter the moment someone runs `--ports 64` against more than one host.
 
-### P2-1. Survive Ctrl-C with a report
+### P2-1. Survive Ctrl-C with a report — **DONE (2026-09-08)**
 
-An 11-minute run interrupted at minute nine currently loses everything: no
-report is written, and there is no record of which inputs were reached.
-Port-major expansion was designed so a partial run is *coherent* — but only if
-you can find out where it stopped.
+`run_host` absorbs the interrupt for the host in flight; `run()` records the
+hosts after it as `not_started`; `main()` keeps a backstop for one landing
+between hosts. The report is written either way and exit status is `1`.
 
-**Fix:** catch `KeyboardInterrupt` in `run()` (`:1120`) and in `main()`, mark the
-in-flight host `interrupted`, and render the report from whatever completed.
+The design decisions worth remembering:
+
+- **A new `skipped` status.** The finalize loop used to turn any unset status
+  into `ok`, which after an interrupt would report a varid as converged
+  without having looked at it. That loop moved out of the `try` block so an
+  interrupted host still reports, and an unset status now means `skipped`
+  when interrupted and `ok` otherwise.
+- **`not_started` is distinct from `unreachable`.** A host that never ran is
+  not a network fault, and omitting those hosts would silently shorten the
+  recap.
+- **A `pending` count.** Records are not built until phase 1 completes, so an
+  interrupt there leaves no per-varid rows. Reporting `0 never reached` for
+  4096 unassessed varids was the first version's bug; the count is now
+  explicit (`4096 parameter(s) never assessed`).
+- **The phase is recorded**, so the error names where it stopped, and a
+  phase-1 interrupt states `no write was issued` — phase 1 only reads, so the
+  device is untouched and there is nothing to be partway through.
+- **Worker threads learn via a flag** checked in `_pace`, since
+  `KeyboardInterrupt` reaches only the main thread. Without it a `--workers`
+  run would keep issuing requests to every remaining host, and the pool's
+  shutdown-wait would block until the whole fleet finished.
+
+Verified on 172.17.223.93 with a real `KeyboardInterrupt` (via
+`_thread.interrupt_main`, which is what Ctrl-C raises):
+
+| Interrupt point | Outcome |
+|---|---|
+| phase 1, 4096-varid check, killed at 4s of a 3m25s run | report written, `interrupted during read; no write was issued`, `4096 parameter(s) never assessed`, exit 1 (`logs/p21-read.*`) |
+| phase 3, `--set-all` writing values already held | 4 `skipped` rows reading `write issued but not verified before the interrupt`, exit 1, **device state unchanged** (`logs/p21-verify.*`) |
+
+14 unit tests, confirmed to fail on regression: an unreached varid falling
+back to `ok` fails 1, dropping the not-started placeholders fails 4.
+
+**Known limitation:** a phase-1 interrupt discards the partial reads it had
+already collected, so it yields no per-varid rows — only the count. Salvaging
+them would mean restructuring `_read` to accumulate into a caller-owned dict.
+Left alone because phase 1 writes nothing, so there is no device state to
+reconcile.
 
 ### P2-2. Revert from a JSON report
 
@@ -189,12 +347,12 @@ prevents the obvious accident.
 
 ## P3 — Coverage and confidence
 
-### P3-1. Unit tests — **started (2026-09-04)**
+### P3-1. Unit tests — **started (2026-09-04), extended (2026-09-08)**
 
-`test_trapSetter.py` exists: 32 `unittest` tests, ~4ms, no network. It covers
+`test_trapSetter.py`: **62** `unittest` tests, ~20ms, no network. Covers
 endpoint discovery and the auth path it selects — the transport decision
 duplicated from ptpMon, hence the one most likely to drift, and the site of the
-P1-1 bug.
+P1-1 bug — plus `--varids`/`--target` (P1-4) and interrupt handling (P2-1).
 
 Confirmed to fail on regression, not merely to pass: reversing
 `_DELEGATE_ENDPOINTS` fails 4 tests, deleting the 1.6 row (reintroducing the
@@ -243,14 +401,20 @@ in keeping. Decide once and write it down either way.
 
 ```
 P1-1  done
-P0-1  one varid, both directions          <- the actual next step
-P0-2  one chunk, mixed outcomes
-P1-2  credentialed write, if P0-1 fails to verify
-P1-3  map_response, informed by P0-2
-P0-3  full 95-param check then apply
-P1-4  --varids / --target
-P0-4  --ports 64, watch device health
-P2-1  Ctrl-C report
-P3-1  unit tests — endpoint discovery done, pure functions outstanding
+P0-1  done - one varid, both directions
+P0-2  done - mixed outcomes, no chunk poisoning
+P0-3  done - check only; the apply half is still outstanding
+P0-4  done - 3 ports; device health not measured
+P1-4  done - --varids / --target
+P2-1  done - Ctrl-C report
+P3-1  unit tests — 62 now; the pure functions are still outstanding
+P0-3b full 95-param apply, then re-apply as a no-op
+P1-2  credentialed write — blocked, needs an older frame
+P1-3  map_response — deferred, not triggered by WebEasy 1.5
 then P2-2, P2-3, P1-5, P3-2, P3-3
+
+P1-4 and P2-1 were the two the tool was not to ship without. Both are done
+and neither needed anything above them. What remains before a wider rollout
+is P0-3b (the 95-param apply and its no-op re-apply) and P3-1's pure-function
+coverage; P1-2 stays blocked on an older frame.
 ```
